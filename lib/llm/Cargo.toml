@@ -195,6 +195,7 @@ bs62 = { version = "0.1" }
 # dynamo-renderer; minijinja's map is the remaining sort point.
 minijinja = { version = "2.21.0", features = ["loader", "loop_controls", "preserve_order"] }
 json-five = { version = "0.3" }
+jsonschema = "0.17"
 
 # media loading in the preprocessor
 reqwest = { workspace = true }

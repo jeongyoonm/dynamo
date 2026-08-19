@@ -3709,6 +3709,12 @@ pub fn validate_response_unsupported_fields(
     request: &NvCreateResponse,
 ) -> Option<impl IntoResponse> {
     let inner = &request.inner;
+    let unsupported_parameter = |message: String| {
+        ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: VALIDATION_PREFIX.to_string() + &message,
+        })
+    };
 
     if let Some(field) = request
         .nvext
@@ -3731,8 +3737,8 @@ pub fn validate_response_unsupported_fields(
         ));
     }
     if inner.previous_response_id.is_some() {
-        return Some(ErrorMessage::not_implemented_error(
-            VALIDATION_PREFIX.to_string() + "`previous_response_id` is not supported.",
+        return Some(unsupported_parameter(
+            "`previous_response_id` is not supported.".to_string(),
         ));
     }
     if inner.prompt.is_some() {
@@ -3756,6 +3762,11 @@ pub fn validate_response_unsupported_fields(
     if inner.max_tool_calls.is_some() {
         return Some(ErrorMessage::not_implemented_error(
             VALIDATION_PREFIX.to_string() + "`max_tool_calls` is not supported.",
+        ));
+    }
+    if inner.store == Some(true) {
+        return Some(unsupported_parameter(
+            "`store: true` is not supported because Dynamo does not persist responses.".to_string(),
         ));
     }
     None
@@ -6109,14 +6120,23 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_unsupported_fields_accepts_store() {
+    fn test_validate_unsupported_fields_rejects_store_true() {
         let mut request = make_base_request();
         request.inner.store = Some(true);
-        let result = validate_response_unsupported_fields(&request);
-        assert!(
-            result.is_none(),
-            "store should be supported for audit opt-in"
-        );
+        let response = validate_response_unsupported_fields(&request)
+            .expect("store: true must be rejected")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_unsupported_fields_rejects_previous_response_id_as_bad_request() {
+        let mut request = make_base_request();
+        request.inner.previous_response_id = Some("resp_missing".to_string());
+        let response = validate_response_unsupported_fields(&request)
+            .expect("previous_response_id must be rejected")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

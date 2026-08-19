@@ -109,6 +109,7 @@ pub const PASSTHROUGH_EXTRA_FIELDS: &[&str] = &[
     "allowed_token_ids",
     "bad_words_token_ids",
     "logprob_token_ids",
+    "prompt_cache_key",
 ];
 
 static IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS: LazyLock<bool> =
@@ -167,6 +168,22 @@ fn validate_no_unsupported_fields_with_ignore(
         serde_json::from_value::<Vec<crate::types::TokenIdType>>(value.clone())
             .map_err(|_| anyhow::anyhow!("`logprob_token_ids` must be an array of token IDs"))?;
     }
+    if let Some(value) = unsupported_fields.get("prompt_cache_key")
+        && !value.is_string()
+    {
+        anyhow::bail!("`prompt_cache_key` must be a string");
+    }
+    Ok(())
+}
+
+pub fn reject_present_parameters(parameters: &[(&str, bool)]) -> Result<(), anyhow::Error> {
+    let unsupported: Vec<_> = parameters
+        .iter()
+        .filter_map(|(name, present)| present.then_some(format!("`{name}`")))
+        .collect();
+    if !unsupported.is_empty() {
+        anyhow::bail!("Unsupported parameter(s): {}", unsupported.join(", "));
+    }
     Ok(())
 }
 
@@ -218,6 +235,13 @@ pub fn validate_response_format(
                     }
                 );
             }
+
+            jsonschema::JSONSchema::compile(&json_schema.schema).map_err(|err| {
+                anyhow::anyhow!(
+                    "`response_format.json_schema.schema` is not a valid JSON Schema: {}",
+                    err
+                )
+            })?;
             Ok(())
         }
     }
@@ -387,27 +411,6 @@ pub fn validate_total_choices(batch_size: usize, n: u8) -> Result<(), anyhow::Er
             total_choices,
             MAX_TOTAL_CHOICES
         );
-    }
-    Ok(())
-}
-
-/// Validates n and temperature interaction
-/// When n > 1, temperature must be > 0 to ensure diverse outputs
-pub fn validate_n_with_temperature(
-    n: Option<u8>,
-    temperature: Option<f32>,
-) -> Result<(), anyhow::Error> {
-    if let Some(n_value) = n
-        && n_value > 1
-    {
-        let temp = temperature.unwrap_or(1.0);
-        if temp == 0.0 {
-            anyhow::bail!(
-                "When n > 1, temperature must be greater than 0 to ensure diverse outputs. Got n={}, temperature={}",
-                n_value,
-                temp
-            );
-        }
     }
     Ok(())
 }
@@ -1020,5 +1023,20 @@ mod tests {
         }))
         .unwrap();
         validate_response_format(&Some(fmt)).unwrap();
+    }
+
+    #[test]
+    fn validate_response_format_rejects_invalid_json_schema_keyword_value() {
+        let fmt = serde_json::from_value(json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "test",
+                "schema": {"type": "nope"}
+            }
+        }))
+        .unwrap();
+
+        let err = validate_response_format(&Some(fmt)).unwrap_err();
+        assert!(err.to_string().contains("not a valid JSON Schema"));
     }
 }

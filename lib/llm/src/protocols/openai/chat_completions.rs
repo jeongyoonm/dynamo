@@ -594,9 +594,18 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         validate::validate_chat_template_args(self.chat_template_args.as_ref())?;
         validate::validate_messages(&self.inner.messages)?;
         validate::validate_model(&self.inner.model)?;
-        // none for store
+        validate::reject_present_parameters(&[
+            ("store", self.inner.store.is_some()),
+            ("metadata", self.inner.metadata.is_some()),
+            ("modalities", self.inner.modalities.is_some()),
+            ("prediction", self.inner.prediction.is_some()),
+            ("service_tier", self.inner.service_tier.is_some()),
+            (
+                "web_search_options",
+                self.inner.web_search_options.is_some(),
+            ),
+        ])?;
         validate::validate_reasoning_effort(&self.inner.reasoning_effort)?;
-        // none for metadata
         validate::validate_frequency_penalty(self.inner.frequency_penalty)?;
         validate::validate_logit_bias(&self.inner.logit_bias)?;
         // none for logprobs
@@ -611,13 +620,10 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
             self.inner.n.unwrap_or(1) as usize,
             self.nvext.as_ref(),
         )?;
-        // none for modalities
-        // none for prediction
         // none for audio
         validate::validate_presence_penalty(self.inner.presence_penalty)?;
         validate::validate_response_format(&self.inner.response_format)?;
         // none for seed
-        validate::validate_service_tier(&self.inner.service_tier)?;
         validate::validate_stop(&self.inner.stop)?;
         // none for stream
         // none for stream_options
@@ -634,7 +640,6 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         validate::validate_min_p(self.get_min_p())?;
         validate::validate_top_k(self.get_top_k())?;
         // Cross-field validation
-        validate::validate_n_with_temperature(self.inner.n, self.inner.temperature)?;
         validate::validate_continue_final_message(
             self.common.add_generation_prompt,
             self.common.continue_final_message,
@@ -653,6 +658,55 @@ mod tests {
     };
     use dynamo_protocols::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
     use serde_json::json;
+
+    #[test]
+    fn test_multiple_choices_accept_zero_temperature() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "n": 2,
+            "temperature": 0.0
+        }))
+        .expect("request must deserialize");
+
+        ValidateRequest::validate(&request)
+            .expect("OpenAI permits deterministic sampling with multiple choices");
+    }
+
+    #[test]
+    fn test_unsupported_platform_parameters_are_rejected() {
+        for (name, value) in [
+            ("store", json!(true)),
+            ("metadata", json!({"suite": "api-compat"})),
+            ("modalities", json!(["audio"])),
+            ("prediction", json!({"type": "content", "content": "x"})),
+            ("service_tier", json!("priority")),
+            ("web_search_options", json!({})),
+        ] {
+            let mut payload = json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            });
+            payload[name] = value;
+            let request: NvCreateChatCompletionRequest =
+                serde_json::from_value(payload).expect("request must deserialize");
+
+            let err = ValidateRequest::validate(&request).unwrap_err();
+            assert!(err.to_string().contains(name));
+        }
+    }
+
+    #[test]
+    fn test_prompt_cache_key_is_accepted_as_passthrough_metadata() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "prompt_cache_key": "api-compat-isolated-prefix"
+        }))
+        .expect("request must deserialize");
+
+        ValidateRequest::validate(&request).expect("prompt_cache_key must be accepted");
+    }
 
     #[test]
     fn test_top_k_sentinel_contract() {
