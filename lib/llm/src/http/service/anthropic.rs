@@ -31,7 +31,8 @@ use tracing::Instrument;
 use super::{
     RouteDoc, apply_request_tool_call_parsing_options,
     disconnect::{
-        ConnectionHandle, create_connection_monitor, monitor_for_disconnects_with_activity,
+        ConnectionHandle, create_connection_monitor,
+        monitor_for_anthropic_disconnects_with_activity,
     },
     metrics::{
         CancellationLabels, Endpoint, ErrorType, InflightGuard,
@@ -44,7 +45,8 @@ use crate::protocols::anthropic::stream_converter::AnthropicStreamConverter;
 use crate::protocols::anthropic::types::{
     AnthropicContentBlock, AnthropicCountTokensRequest, AnthropicCountTokensResponse,
     AnthropicCreateMessageRequest, AnthropicErrorBody, AnthropicErrorResponse, AnthropicMessage,
-    AnthropicMessageContent, AnthropicTool, SystemContent, chat_completion_to_anthropic_response,
+    AnthropicMessageContent, AnthropicRole, AnthropicTool, SystemContent,
+    chat_completion_to_anthropic_response,
 };
 use crate::protocols::common::extensions::{
     AGENT_CONTEXT_CONTEXT_KEY, SESSION_AFFINITY_CONTEXT_KEY, agent_context_from_headers,
@@ -146,6 +148,32 @@ enum AnthropicRequestValidationError {
     NotImplemented(String),
 }
 
+const SUPPORTED_ANTHROPIC_VERSION: &str = "2023-06-01";
+
+fn validate_anthropic_version(headers: &HeaderMap) -> Result<(), AnthropicRequestValidationError> {
+    let version = headers
+        .get("anthropic-version")
+        .ok_or_else(|| {
+            AnthropicRequestValidationError::InvalidArgument(
+                "anthropic-version: header required".to_string(),
+            )
+        })?
+        .to_str()
+        .map_err(|_| {
+            AnthropicRequestValidationError::InvalidArgument(
+                "anthropic-version: must be valid ASCII".to_string(),
+            )
+        })?;
+
+    if version != SUPPORTED_ANTHROPIC_VERSION {
+        return Err(AnthropicRequestValidationError::InvalidArgument(format!(
+            "anthropic-version: unsupported version {version:?}; supported version is {SUPPORTED_ANTHROPIC_VERSION}"
+        )));
+    }
+
+    Ok(())
+}
+
 impl AnthropicRequestValidationError {
     fn status(&self) -> StatusCode {
         match self {
@@ -184,8 +212,16 @@ fn validate_anthropic_messages(
         ));
     }
 
+    let mut pending_tool_uses: Option<(usize, HashSet<String>)> = None;
+
     for (message_index, message) in messages.iter().enumerate() {
         let AnthropicMessageContent::Blocks { content } = &message.content else {
+            if let Some((assistant_index, pending)) = pending_tool_uses.take() {
+                return Err(AnthropicRequestValidationError::InvalidArgument(format!(
+                    "messages[{assistant_index}]: tool_use ids {:?} were found without tool_result blocks immediately after",
+                    sorted_ids(&pending)
+                )));
+            }
             continue;
         };
         if content.is_empty() {
@@ -193,6 +229,57 @@ fn validate_anthropic_messages(
                 "messages[{message_index}].content: must contain at least one content block"
             )));
         }
+        if let Some((assistant_index, pending)) = pending_tool_uses.take() {
+            if message.role != AnthropicRole::User {
+                return Err(AnthropicRequestValidationError::InvalidArgument(format!(
+                    "messages[{assistant_index}]: tool_use ids {:?} were found without a user tool_result message immediately after",
+                    sorted_ids(&pending)
+                )));
+            }
+
+            let mut returned = HashSet::new();
+            let mut saw_non_result = false;
+            for (block_index, block) in content.iter().enumerate() {
+                match block {
+                    AnthropicContentBlock::ToolResult { tool_use_id, .. } => {
+                        if saw_non_result {
+                            return Err(AnthropicRequestValidationError::InvalidArgument(format!(
+                                "messages[{message_index}].content[{block_index}]: tool_result blocks must come before other content"
+                            )));
+                        }
+                        if !pending.contains(tool_use_id) {
+                            return Err(AnthropicRequestValidationError::InvalidArgument(format!(
+                                "messages[{message_index}].content[{block_index}].tool_use_id: {tool_use_id:?} does not match a tool_use id from messages[{assistant_index}]"
+                            )));
+                        }
+                        if !returned.insert(tool_use_id.clone()) {
+                            return Err(AnthropicRequestValidationError::InvalidArgument(format!(
+                                "messages[{message_index}].content[{block_index}].tool_use_id: duplicate tool_result for {tool_use_id:?}"
+                            )));
+                        }
+                    }
+                    _ => saw_non_result = true,
+                }
+            }
+
+            if returned != pending {
+                let missing = pending.difference(&returned).cloned().collect();
+                return Err(AnthropicRequestValidationError::InvalidArgument(format!(
+                    "messages[{assistant_index}]: tool_use ids {:?} were found without tool_result blocks immediately after",
+                    sorted_ids(&missing)
+                )));
+            }
+        } else if message.role == AnthropicRole::User {
+            for (block_index, block) in content.iter().enumerate() {
+                if let AnthropicContentBlock::ToolResult { tool_use_id, .. } = block {
+                    return Err(AnthropicRequestValidationError::InvalidArgument(format!(
+                        "messages[{message_index}].content[{block_index}].tool_use_id: {tool_use_id:?} has no immediately preceding tool_use"
+                    )));
+                }
+            }
+        }
+
+        let mut tool_use_ids = HashSet::new();
         for (block_index, block) in content.iter().enumerate() {
             if let AnthropicContentBlock::Other(value) = block {
                 if !value.is_object() {
@@ -213,9 +300,36 @@ fn validate_anthropic_messages(
                     "messages[{message_index}].content[{block_index}]: content block type \"{block_type}\" is not supported"
                 )));
             }
+
+            if message.role == AnthropicRole::Assistant
+                && let AnthropicContentBlock::ToolUse { id, .. } = block
+                && !tool_use_ids.insert(id.clone())
+            {
+                return Err(AnthropicRequestValidationError::InvalidArgument(format!(
+                    "messages[{message_index}].content[{block_index}].id: duplicate tool_use id {id:?}"
+                )));
+            }
+        }
+
+        if !tool_use_ids.is_empty() {
+            pending_tool_uses = Some((message_index, tool_use_ids));
         }
     }
+
+    if let Some((assistant_index, pending)) = pending_tool_uses {
+        return Err(AnthropicRequestValidationError::InvalidArgument(format!(
+            "messages[{assistant_index}]: tool_use ids {:?} were found without tool_result blocks immediately after",
+            sorted_ids(&pending)
+        )));
+    }
+
     Ok(())
+}
+
+fn sorted_ids(ids: &HashSet<String>) -> Vec<&str> {
+    let mut ids: Vec<_> = ids.iter().map(String::as_str).collect();
+    ids.sort_unstable();
+    ids
 }
 
 fn validate_anthropic_tools(
@@ -265,6 +379,15 @@ async fn handler_anthropic_messages(
         streaming,
         &request_id,
     );
+
+    if let Err(error) = validate_anthropic_version(&headers) {
+        inflight_guard.mark_error(error.metric_error_type());
+        return Err(anthropic_error(
+            error.status(),
+            error.anthropic_error_type(),
+            error.message(),
+        ));
+    }
 
     if let Err(error) = validate_anthropic_messages(&request.messages) {
         inflight_guard.mark_error(error.metric_error_type());
@@ -703,7 +826,7 @@ async fn anthropic_messages(
         };
 
         let keep_alive = state.sse_keep_alive_for_response(stream_can_defer_all_output);
-        let stream = monitor_for_disconnects_with_activity(
+        let stream = monitor_for_anthropic_disconnects_with_activity(
             full_stream,
             ctx,
             inflight_guard,
@@ -787,8 +910,16 @@ async fn anthropic_messages(
 /// Returns an estimated input token count using a len/3 heuristic.
 async fn handler_count_tokens(
     State((state, _template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
+    headers: HeaderMap,
     Json(mut request): Json<AnthropicCountTokensRequest>,
 ) -> Result<Response, Response> {
+    if let Err(error) = validate_anthropic_version(&headers) {
+        return Err(anthropic_error(
+            error.status(),
+            error.anthropic_error_type(),
+            error.message(),
+        ));
+    }
     if let Err(error) = validate_anthropic_messages(&request.messages) {
         return Err(anthropic_error(
             error.status(),
@@ -1185,6 +1316,81 @@ pub(crate) fn unmatched_route_response(method: &Method, uri: &Uri) -> Response {
 mod tests {
     use super::*;
     use crate::protocols::common::extensions::parse_nvext;
+
+    fn parse_messages(value: serde_json::Value) -> Vec<AnthropicMessage> {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn anthropic_version_header_is_required_and_supported() {
+        let missing = HeaderMap::new();
+        assert!(validate_anthropic_version(&missing).is_err());
+
+        let mut supported = HeaderMap::new();
+        supported.insert(
+            "anthropic-version",
+            SUPPORTED_ANTHROPIC_VERSION.parse().unwrap(),
+        );
+        assert!(validate_anthropic_version(&supported).is_ok());
+
+        supported.insert("anthropic-version", "1900-01-01".parse().unwrap());
+        assert!(validate_anthropic_version(&supported).is_err());
+    }
+
+    #[test]
+    fn anthropic_tool_results_must_match_immediately_preceding_uses() {
+        let valid = parse_messages(serde_json::json!([
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_a", "name": "a", "input": {}},
+                    {"type": "tool_use", "id": "toolu_b", "name": "b", "input": {}}
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_a", "content": "a"},
+                    {"type": "tool_result", "tool_use_id": "toolu_b", "content": "b"},
+                    {"type": "text", "text": "continue"}
+                ]
+            }
+        ]));
+        assert!(validate_anthropic_messages(&valid).is_ok());
+
+        let mismatched = parse_messages(serde_json::json!([
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_expected", "name": "a", "input": {}}
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_wrong", "content": "x"}
+                ]
+            }
+        ]));
+        assert!(validate_anthropic_messages(&mismatched).is_err());
+
+        let wrong_order = parse_messages(serde_json::json!([
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_a", "name": "a", "input": {}}
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "result:"},
+                    {"type": "tool_result", "tool_use_id": "toolu_a", "content": "x"}
+                ]
+            }
+        ]));
+        assert!(validate_anthropic_messages(&wrong_order).is_err());
+    }
 
     fn request_with_nvext() -> AnthropicCreateMessageRequest {
         serde_json::from_value(serde_json::json!({

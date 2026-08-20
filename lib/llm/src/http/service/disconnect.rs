@@ -300,10 +300,28 @@ async fn connection_monitor(
 
 type StreamErrorFormatter = fn(&(dyn std::error::Error + 'static)) -> (ErrorType, String);
 
-#[derive(Default)]
 struct StreamMonitorOptions {
     activity_rx: Option<mpsc::UnboundedReceiver<()>>,
     error_signal: Option<StreamErrorSignal>,
+    /// Named SSE event for terminal errors (Anthropic `error` events) instead
+    /// of OpenAI's data-only error chunk.
+    error_event_name: Option<&'static str>,
+    /// Whether the stream ends with OpenAI's `[DONE]` sentinel. Anthropic
+    /// Messages streams terminate with `message_stop` and must not emit it.
+    emit_done_sentinel: bool,
+}
+
+impl Default for StreamMonitorOptions {
+    /// OpenAI-SSE defaults preserve the historical behavior of every existing
+    /// caller.
+    fn default() -> Self {
+        Self {
+            activity_rx: None,
+            error_signal: None,
+            error_event_name: None,
+            emit_done_sentinel: true,
+        }
+    }
 }
 
 fn openai_stream_error(_error: &(dyn std::error::Error + 'static)) -> (ErrorType, String) {
@@ -313,6 +331,19 @@ fn openai_stream_error(_error: &(dyn std::error::Error + 'static)) -> (ErrorType
             "message": error.to_string(),
             "type": error.openai_type_slug(),
             "code": error.status().as_u16(),
+        }
+    })
+    .to_string();
+    (ErrorType::Internal, body)
+}
+
+fn anthropic_stream_error(_error: &(dyn std::error::Error + 'static)) -> (ErrorType, String) {
+    let error = SanitizedError::Internal;
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "message": error.to_string(),
         }
     })
     .to_string();
@@ -406,6 +437,31 @@ pub fn monitor_for_disconnects_with_activity(
     )
 }
 
+/// Anthropic Messages streaming ends with `message_stop`, not OpenAI's
+/// `[DONE]` sentinel. Errors are named Anthropic `error` events.
+pub fn monitor_for_anthropic_disconnects_with_activity(
+    stream: impl Stream<Item = Result<Event, axum::Error>>,
+    context: Arc<dyn AsyncEngineContext>,
+    inflight_guard: InflightGuard,
+    stream_handle: ConnectionHandle,
+    activity_rx: mpsc::UnboundedReceiver<()>,
+) -> impl Stream<Item = Result<Event, axum::Error>> {
+    monitor_for_disconnects_with_timeout_error_and_keep_alive(
+        stream,
+        context,
+        inflight_guard,
+        stream_handle,
+        backend_stream_timeout(),
+        anthropic_stream_error,
+        StreamMonitorOptions {
+            activity_rx: Some(activity_rx),
+            error_event_name: Some("error"),
+            emit_done_sentinel: false,
+            ..Default::default()
+        },
+    )
+}
+
 #[cfg(test)]
 fn monitor_for_disconnects_with_timeout(
     stream: impl Stream<Item = Result<Event, axum::Error>>,
@@ -439,6 +495,8 @@ fn monitor_for_disconnects_with_timeout_error_and_keep_alive(
     let StreamMonitorOptions {
         mut activity_rx,
         error_signal,
+        error_event_name,
+        emit_done_sentinel,
     } = options;
 
     // Default to Cancelled: if the stream is dropped unexpectedly (e.g. client
@@ -480,8 +538,14 @@ fn monitor_for_disconnects_with_timeout_error_and_keep_alive(
                             // would mis-attribute the fault as a client disconnect).
                             stream_handle.disarm();
                             tracing::error!("Streaming error: {err}");
-                            yield Event::default().data(error_body);
-                            yield Event::default().data("[DONE]");
+                            let mut error_event = Event::default().data(error_body);
+                            if let Some(event_name) = error_event_name {
+                                error_event = error_event.event(event_name);
+                            }
+                            yield error_event;
+                            if emit_done_sentinel {
+                                yield Event::default().data("[DONE]");
+                            }
                             // Break to prevent any subsequent mark_ok() from overwriting the error
                             break;
                         }
@@ -495,7 +559,9 @@ fn monitor_for_disconnects_with_timeout_error_and_keep_alive(
 
                             // todo: if we yield a dynamo sentinel event, we need to do it before the done or the
                             // async-openai client will chomp it.
-                            yield Event::default().data("[DONE]");
+                            if emit_done_sentinel {
+                                yield Event::default().data("[DONE]");
+                            }
                             break;
                         }
                     }
@@ -1055,6 +1121,49 @@ mod tests {
             .await
             .expect("body bytes");
         String::from_utf8(body.to_vec()).expect("utf8 body")
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_ends_at_message_stop_without_done_sentinel() {
+        let (_metrics, guard, ctx, handle) = setup_test("anthropic-model", "req-anthropic");
+        let (_activity_tx, activity_rx) = mpsc::unbounded_channel();
+        let stream = futures::stream::iter(vec![Ok(Event::default()
+            .event("message_stop")
+            .data(r#"{"type":"message_stop"}"#))]);
+        let monitored = monitor_for_anthropic_disconnects_with_activity(
+            stream,
+            ctx,
+            guard,
+            handle,
+            activity_rx,
+        );
+        let body = collect_sse_body(monitored).await;
+
+        assert!(body.contains("event: message_stop"));
+        assert!(body.contains(r#"data: {"type":"message_stop"}"#));
+        assert!(!body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_error_is_named_json_without_done_sentinel() {
+        let (_metrics, guard, ctx, handle) =
+            setup_test("anthropic-error-model", "req-anthropic-error");
+        let (_activity_tx, activity_rx) = mpsc::unbounded_channel();
+        let backend_detail = "sensitive anthropic backend detail";
+        let stream = simulate_mid_stream_error(1, backend_detail);
+        let monitored = monitor_for_anthropic_disconnects_with_activity(
+            stream,
+            ctx,
+            guard,
+            handle,
+            activity_rx,
+        );
+        let body = collect_sse_body(monitored).await;
+
+        assert!(body.contains("event: error"));
+        assert!(body.contains(r#""type":"api_error""#));
+        assert!(!body.contains("[DONE]"));
+        assert!(!body.contains(backend_detail));
     }
 
     /// Assert the post-fix SSE fault contract: a parsed structured error frame

@@ -16,7 +16,7 @@ use uuid::Uuid;
 use super::types::{
     AnthropicDelta, AnthropicErrorBody, AnthropicMessageDeltaBody, AnthropicMessageResponse,
     AnthropicResponseContentBlock, AnthropicStopReason, AnthropicStreamEvent, AnthropicUsage,
-    completion_usage_to_anthropic, new_tool_use_id,
+    SYNTHETIC_THINKING_SIGNATURE, completion_usage_to_anthropic, new_tool_use_id,
 };
 use crate::protocols::openai::chat_completions::NvCreateChatCompletionStreamResponse;
 use crate::protocols::unified::AnthropicContext;
@@ -438,7 +438,7 @@ impl AnthropicStreamConverter {
                     self.thinking_block_closed = true;
                     // Emit signature delta to close the thinking block.
                     // The engine doesn't produce Anthropic-style cryptographic signatures,
-                    // so we use "erased" (the standard placeholder per the Anthropic spec).
+                    // so use Dynamo's explicit wire-compatibility placeholder.
                     // When `api_context` is available and the original request had
                     // `thinking.thinking_type == "enabled"`, this is expected — the backend
                     // simply doesn't generate real signatures. If/when the backend starts
@@ -447,7 +447,7 @@ impl AnthropicStreamConverter {
                     let sig_delta = AnthropicStreamEvent::ContentBlockDelta {
                         index: self.thinking_block_index,
                         delta: AnthropicDelta::SignatureDelta {
-                            signature: "erased".to_string(),
+                            signature: SYNTHETIC_THINKING_SIGNATURE.to_string(),
                         },
                     };
                     events.push(self.serialize_event("content_block_delta", &sig_delta));
@@ -492,7 +492,7 @@ impl AnthropicStreamConverter {
                     let sig_delta = AnthropicStreamEvent::ContentBlockDelta {
                         index: self.thinking_block_index,
                         delta: AnthropicDelta::SignatureDelta {
-                            signature: "erased".to_string(),
+                            signature: SYNTHETIC_THINKING_SIGNATURE.to_string(),
                         },
                     };
                     events.push(self.serialize_event("content_block_delta", &sig_delta));
@@ -544,7 +544,7 @@ impl AnthropicStreamConverter {
             let sig_delta = AnthropicStreamEvent::ContentBlockDelta {
                 index: self.thinking_block_index,
                 delta: AnthropicDelta::SignatureDelta {
-                    signature: "erased".to_string(),
+                    signature: SYNTHETIC_THINKING_SIGNATURE.to_string(),
                 },
             };
             events.push(self.serialize_event("content_block_delta", &sig_delta));
@@ -743,7 +743,7 @@ impl AnthropicStreamConverter {
                     let ev = AnthropicStreamEvent::ContentBlockDelta {
                         index: self.thinking_block_index,
                         delta: AnthropicDelta::SignatureDelta {
-                            signature: "erased".to_string(),
+                            signature: SYNTHETIC_THINKING_SIGNATURE.to_string(),
                         },
                     };
                     events.push(make_tagged_event("content_block_delta", &ev));
@@ -785,7 +785,7 @@ impl AnthropicStreamConverter {
                     let ev = AnthropicStreamEvent::ContentBlockDelta {
                         index: self.thinking_block_index,
                         delta: AnthropicDelta::SignatureDelta {
-                            signature: "erased".to_string(),
+                            signature: SYNTHETIC_THINKING_SIGNATURE.to_string(),
                         },
                     };
                     events.push(make_tagged_event("content_block_delta", &ev));
@@ -831,7 +831,7 @@ impl AnthropicStreamConverter {
             let ev = AnthropicStreamEvent::ContentBlockDelta {
                 index: self.thinking_block_index,
                 delta: AnthropicDelta::SignatureDelta {
-                    signature: "erased".to_string(),
+                    signature: SYNTHETIC_THINKING_SIGNATURE.to_string(),
                 },
             };
             events.push(make_tagged_event("content_block_delta", &ev));

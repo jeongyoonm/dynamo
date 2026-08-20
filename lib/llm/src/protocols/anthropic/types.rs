@@ -30,6 +30,12 @@ use crate::protocols::openai::chat_completions::{
 };
 use crate::protocols::openai::common_ext::CommonExt;
 
+/// Synthetic opaque signature used when a non-Anthropic backend exposes
+/// reasoning but cannot produce Anthropic's cryptographic thinking signature.
+/// This provides wire compatibility only; it is not portable to Anthropic's
+/// service and must not be described as cryptographic verification.
+pub(super) const SYNTHETIC_THINKING_SIGNATURE: &str = "erased";
+
 // ---------------------------------------------------------------------------
 // Conversion: AnthropicCreateMessageRequest -> NvCreateChatCompletionRequest
 // ---------------------------------------------------------------------------
@@ -605,7 +611,7 @@ pub fn chat_completion_to_anthropic_response(
                 0,
                 AnthropicResponseContentBlock::Thinking {
                     thinking,
-                    signature: String::new(),
+                    signature: SYNTHETIC_THINKING_SIGNATURE.to_string(),
                 },
             );
         }
@@ -1078,7 +1084,7 @@ mod tests {
                         role: dynamo_protocols::types::Role::Assistant,
                         function_call: None,
                         audio: None,
-                        reasoning_content: None,
+                        reasoning_content: Some("brief reasoning".to_string()),
                     },
                     finish_reason: Some(dynamo_protocols::types::FinishReason::Stop),
                     logprobs: None,
@@ -1107,8 +1113,18 @@ mod tests {
         assert_eq!(response.stop_reason, Some(AnthropicStopReason::EndTurn));
         assert_eq!(response.usage.input_tokens, 10);
         assert_eq!(response.usage.output_tokens, 5);
-        assert_eq!(response.content.len(), 1);
+        assert_eq!(response.content.len(), 2);
         match &response.content[0] {
+            AnthropicResponseContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                assert_eq!(thinking, "brief reasoning");
+                assert_eq!(signature, SYNTHETIC_THINKING_SIGNATURE);
+            }
+            _ => panic!("expected thinking block"),
+        }
+        match &response.content[1] {
             AnthropicResponseContentBlock::Text { text, .. } => {
                 assert_eq!(text, "Hello!");
             }
