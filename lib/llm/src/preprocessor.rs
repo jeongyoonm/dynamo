@@ -4010,7 +4010,7 @@ impl OpenAIPreprocessor {
         use crate::protocols::openai::chat_completions::{tool_parser_v2, unified_parser};
         let uses_tool_call_structural_tag = guided_tool_constraint.uses_structural_tag();
         let defer_reasoning_for_nonempty_content =
-            Self::wants_reasoning_as_content_when_empty(request.chat_template_args.as_ref());
+            Self::chat_request_wants_reasoning_as_content_when_empty(request);
         // Two different streaming paths can release a grammar-constrained tool call
         // before its payload closes: the unified (v2) adapter below and the jail near
         // the end of this function. Both must obey the same rollback lever, so
@@ -5339,6 +5339,36 @@ impl OpenAIPreprocessor {
         })
     }
 
+    /// Whether an OpenAI tool-result continuation explicitly requires a normal
+    /// assistant answer. With `tool_choice=none`, a reasoning-only terminal
+    /// turn cannot be consumed through the standard OpenAI `content` field.
+    ///
+    /// Keep this request-shaped rather than parser-shaped: GLM exposed the
+    /// issue, but any force-reasoning parser can encounter the same ambiguous
+    /// clean stop when the model omits its reasoning end marker.
+    pub(crate) fn is_tool_result_content_continuation(
+        request: &NvCreateChatCompletionRequest,
+    ) -> bool {
+        matches!(
+            request.inner.tool_choice.as_ref(),
+            Some(ChatCompletionToolChoiceOption::None)
+        ) && request
+            .inner
+            .messages
+            .iter()
+            .any(|message| matches!(message, ChatCompletionRequestMessage::Tool(_)))
+    }
+
+    /// Combined OpenAI chat policy. Explicit `force_nonempty_content` remains
+    /// supported, while a tool-result continuation gets the same serving-layer
+    /// guarantee without requiring a model-specific client option.
+    pub(crate) fn chat_request_wants_reasoning_as_content_when_empty(
+        request: &NvCreateChatCompletionRequest,
+    ) -> bool {
+        Self::wants_reasoning_as_content_when_empty(request.chat_template_args.as_ref())
+            || Self::is_tool_result_content_continuation(request)
+    }
+
     /// Whether this request's stream can withhold every data frame while it
     /// buffers, which is the only reason to force SSE keep-alive frames on.
     ///
@@ -5361,6 +5391,7 @@ impl OpenAIPreprocessor {
         tool_call_parser: Option<&str>,
         reasoning_parser: Option<&str>,
         chat_template_args: Option<&std::collections::HashMap<String, serde_json::Value>>,
+        wants_reasoning_as_content_when_empty: bool,
     ) -> bool {
         // Unified Qwen and Muse now use the same force-nonempty deferral as the v1
         // reasoning path, so their reasoning-only turns can withhold every meaningful
@@ -5372,7 +5403,7 @@ impl OpenAIPreprocessor {
             )
             .is_some();
         has_reasoning_decoder
-            && Self::wants_reasoning_as_content_when_empty(chat_template_args)
+            && wants_reasoning_as_content_when_empty
             && !Self::is_reasoning_disabled_by_request(reasoning_parser, chat_template_args)
     }
 
@@ -10317,7 +10348,56 @@ mod tests {
             None,
             Some("muse_glimmer"),
             Some(&args),
+            true,
         ));
+    }
+
+    #[test]
+    fn test_tool_result_content_continuation_policy() {
+        let request = |tool_choice: serde_json::Value, include_tool_result: bool| {
+            let mut messages = vec![serde_json::json!({
+                "role": "user",
+                "content": "Use the weather tool."
+            })];
+            if include_tool_result {
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": "call_weather",
+                    "content": "{\"temperature\":21}"
+                }));
+            }
+            serde_json::from_value::<NvCreateChatCompletionRequest>(serde_json::json!({
+                "model": "test-model",
+                "messages": messages,
+                "tool_choice": tool_choice
+            }))
+            .unwrap()
+        };
+
+        let continuation = request(serde_json::json!("none"), true);
+        assert!(OpenAIPreprocessor::is_tool_result_content_continuation(
+            &continuation
+        ));
+        assert!(
+            OpenAIPreprocessor::chat_request_wants_reasoning_as_content_when_empty(&continuation)
+        );
+
+        let auto_continuation = request(serde_json::json!("auto"), true);
+        assert!(!OpenAIPreprocessor::is_tool_result_content_continuation(
+            &auto_continuation
+        ));
+
+        let ordinary_none = request(serde_json::json!("none"), false);
+        assert!(!OpenAIPreprocessor::is_tool_result_content_continuation(
+            &ordinary_none
+        ));
+
+        let mut explicit = request(serde_json::json!("auto"), false);
+        explicit.chat_template_args = Some(std::collections::HashMap::from([(
+            "force_nonempty_content".to_string(),
+            serde_json::Value::Bool(true),
+        )]));
+        assert!(OpenAIPreprocessor::chat_request_wants_reasoning_as_content_when_empty(&explicit));
     }
 
     /// Different query strings must produce different hashes. `?v=1` and

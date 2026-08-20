@@ -544,6 +544,7 @@ async fn anthropic_messages(
             parsing_options.tool_call_parser.as_deref(),
             parsing_options.reasoning_parser.as_deref(),
             request.chat_template_args.as_ref(),
+            move_reasoning_to_content_when_empty,
         );
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);

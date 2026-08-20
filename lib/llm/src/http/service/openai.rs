@@ -2852,19 +2852,23 @@ async fn chat_completions(
         parsing_options.with_parallel_tool_calls(request.inner.parallel_tool_calls);
     let enforce_single_tool_call = request.inner.parallel_tool_calls == Some(false);
 
-    // Any force_nonempty_content=true request: surface reasoning as content when
-    // the turn produced none. See `wants_reasoning_as_content_when_empty`.
+    // Explicit force_nonempty_content requests and tool-result continuations
+    // with tool_choice=none must surface a normal assistant answer when parsing
+    // otherwise leaves a reasoning-only terminal turn.
     let move_reasoning_to_content_when_empty =
-        crate::preprocessor::OpenAIPreprocessor::wants_reasoning_as_content_when_empty(
-            request.chat_template_args.as_ref(),
+        crate::preprocessor::OpenAIPreprocessor::chat_request_wants_reasoning_as_content_when_empty(
+            &request,
         );
     let parsing_options = parsing_options
         .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty);
 
     // Computed before `request` moves into `generate`. Only a stream that can
     // withhold every data frame needs forced keep-alive frames.
-    let stream_can_defer_all_output =
-        request_stream_can_defer_all_output(&parsing_options, request.chat_template_args.as_ref());
+    let stream_can_defer_all_output = request_stream_can_defer_all_output(
+        &parsing_options,
+        request.chat_template_args.as_ref(),
+        move_reasoning_to_content_when_empty,
+    );
 
     let mut response_collector = state
         .metrics_clone()
@@ -3129,11 +3133,13 @@ fn normalize_chat_reasoning_template_args(
 fn request_stream_can_defer_all_output(
     parsing_options: &ParsingOptions,
     chat_template_args: Option<&HashMap<String, serde_json::Value>>,
+    wants_reasoning_as_content_when_empty: bool,
 ) -> bool {
     crate::preprocessor::OpenAIPreprocessor::stream_can_defer_all_output(
         parsing_options.tool_call_parser.as_deref(),
         parsing_options.reasoning_parser.as_deref(),
         chat_template_args,
+        wants_reasoning_as_content_when_empty,
     )
 }
 
@@ -3510,8 +3516,11 @@ async fn responses(
     // Computed before `request` moves into `generate`. Responses streams use
     // the same force-nonempty deferral as chat completions and therefore need
     // the same fallback keep-alive when every data frame may be withheld.
-    let stream_can_defer_all_output =
-        request_stream_can_defer_all_output(&parsing_options, request.chat_template_args.as_ref());
+    let stream_can_defer_all_output = request_stream_can_defer_all_output(
+        &parsing_options,
+        request.chat_template_args.as_ref(),
+        move_reasoning_to_content_when_empty,
+    );
 
     let mut response_collector = state
         .metrics_clone()
@@ -5425,7 +5434,11 @@ mod tests {
         let parsing_options = ParsingOptions::new(Some("qwen3_coder".into()), Some("qwen3".into()));
         let mut chat_template_args = HashMap::new();
 
-        assert!(!request_stream_can_defer_all_output(&parsing_options, None));
+        assert!(!request_stream_can_defer_all_output(
+            &parsing_options,
+            None,
+            false
+        ));
 
         chat_template_args.insert(
             "force_nonempty_content".to_string(),
@@ -5433,7 +5446,8 @@ mod tests {
         );
         assert!(!request_stream_can_defer_all_output(
             &parsing_options,
-            Some(&chat_template_args)
+            Some(&chat_template_args),
+            false
         ));
 
         chat_template_args.insert(
@@ -5442,13 +5456,15 @@ mod tests {
         );
         assert!(request_stream_can_defer_all_output(
             &parsing_options,
-            Some(&chat_template_args)
+            Some(&chat_template_args),
+            true
         ));
 
         let muse_tool_parser_only = ParsingOptions::new(Some("muse_glimmer".into()), None);
         assert!(request_stream_can_defer_all_output(
             &muse_tool_parser_only,
-            Some(&chat_template_args)
+            Some(&chat_template_args),
+            true
         ));
     }
 
