@@ -1139,7 +1139,7 @@ def vllm_processor_module(monkeypatch):
     import dynamo.frontend.vllm_processor as module
 
     class FakeEngineCoreOutput:
-        __struct_fields__ = ()
+        __struct_fields__ = ("new_logprobs",)
 
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
@@ -1154,7 +1154,6 @@ def vllm_processor_module(monkeypatch):
 async def test_generator_preserves_zero_top_logprobs(
     vllm_processor_module,
     monkeypatch,
-    caplog,
 ):
     class RequestForSampling(SimpleNamespace):
         model_fields = frozenset()
@@ -1217,9 +1216,38 @@ async def test_generator_preserves_zero_top_logprobs(
                 }
             )
         )
+
+
+def test_build_engine_core_logprobs(vllm_processor_module):
+    converted = vllm_processor_module._build_engine_core_logprobs(
+        [7, 8],
+        [-0.7, -0.8],
+        [
+            [
+                {"token_id": 70, "logprob": -1.7, "rank": 2},
+                {"token_id": 7, "logprob": -0.7, "rank": 1},
+            ],
+            [
+                {"token_id": 80, "logprob": -1.8, "rank": 2},
+                {"token_id": 8, "logprob": -0.8, "rank": 1},
+            ],
+        ],
+    )
+
+    assert converted is not None
+    assert converted.logprob_token_ids.tolist() == [[7, 70], [8, 80]]
+    assert converted.logprobs.flatten().tolist() == pytest.approx(
+        [-0.7, -1.7, -0.8, -1.8]
+    )
+    assert converted.sampled_token_ranks.tolist() == [1, 1]
+
+
+def test_build_engine_core_logprobs_rejects_misalignment(vllm_processor_module):
     assert (
-        "Logprobs requested but not supported in distributed inference mode"
-        in caplog.messages
+        vllm_processor_module._build_engine_core_logprobs(
+            [7, 8], [-0.7], [[{"token_id": 7, "logprob": -0.7, "rank": 1}]]
+        )
+        is None
     )
 
 
@@ -1446,6 +1474,39 @@ async def test_generator_inner_forwards_reasoning_parser_and_model_config(
 
     assert captured.get("reasoning_parser_class") is _SentinelReasoningParser
     assert captured.get("model_config") is sentinel_model_config
+
+
+def test_streaming_postprocessor_converts_logprobs_to_openai_schema():
+    from vllm.logprobs import Logprob
+
+    post = StreamingPostProcessor.__new__(StreamingPostProcessor)
+    post.tokenizer = SimpleNamespace(decode=lambda token_id: f"token-{token_id}")
+    post.request_for_sampling = SimpleNamespace(top_logprobs=1)
+
+    converted = post._openai_logprobs(
+        SimpleNamespace(
+            token_ids=[7],
+            logprobs=[
+                {
+                    7: Logprob(logprob=-0.25, rank=1, decoded_token="x"),
+                    8: Logprob(logprob=-1.25, rank=2, decoded_token="y"),
+                }
+            ],
+        )
+    )
+
+    assert converted == {
+        "content": [
+            {
+                "token": "x",
+                "logprob": -0.25,
+                "bytes": [120],
+                "top_logprobs": [
+                    {"token": "x", "logprob": -0.25, "bytes": [120]}
+                ],
+            }
+        ]
+    }
 
 
 def _make_processor(module, routed_engine):

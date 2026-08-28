@@ -1196,6 +1196,54 @@ class StreamingPostProcessor:
             for _, tool_call in self.in_progress_tool_calls.items()
         ]
 
+    def _openai_logprobs(self, output: Any) -> dict[str, Any] | None:
+        """Convert vLLM's internal token-id logprobs to the OpenAI schema."""
+        if output.logprobs is None:
+            return None
+
+        requested_top = self.request_for_sampling.top_logprobs
+        content: list[dict[str, Any]] = []
+        for token_id, position in zip(output.token_ids or [], output.logprobs):
+            position = position or {}
+            sampled = position.get(token_id)
+            token = (
+                sampled.decoded_token
+                if sampled is not None and sampled.decoded_token is not None
+                else self.tokenizer.decode(token_id)
+            )
+            top: list[dict[str, Any]] = []
+            for index, (candidate_id, candidate) in enumerate(position.items()):
+                if requested_top != -1 and (
+                    requested_top is None or index >= requested_top
+                ):
+                    break
+                candidate_token = (
+                    candidate.decoded_token
+                    if candidate.decoded_token is not None
+                    else self.tokenizer.decode(candidate_id)
+                )
+                top.append(
+                    {
+                        "token": candidate_token,
+                        "logprob": max(float(candidate.logprob), -9999.0),
+                        "bytes": list(
+                            candidate_token.encode("utf-8", errors="replace")
+                        ),
+                    }
+                )
+            content.append(
+                {
+                    "token": token,
+                    "logprob": max(
+                        float(sampled.logprob) if sampled is not None else -9999.0,
+                        -9999.0,
+                    ),
+                    "bytes": list(token.encode("utf-8", errors="replace")),
+                    "top_logprobs": top,
+                }
+            )
+        return {"content": content}
+
     def _remap_finish_reason(
         self, output_index: int, finish_reason: str | None
     ) -> str | None:
@@ -1220,7 +1268,11 @@ class StreamingPostProcessor:
             "finish_reason": self._remap_finish_reason(
                 output.index, output.finish_reason
             ),
-            "logprobs": (None if self._suppress_reasoning_output else output.logprobs),
+            "logprobs": (
+                None
+                if self._suppress_reasoning_output
+                else self._openai_logprobs(output)
+            ),
         }
         self.in_progress_tool_calls.clear()
         return choice
@@ -1244,7 +1296,11 @@ class StreamingPostProcessor:
             "finish_reason": self._remap_finish_reason(
                 output.index, output.finish_reason
             ),
-            "logprobs": (None if self._suppress_reasoning_output else output.logprobs),
+            "logprobs": (
+                None
+                if self._suppress_reasoning_output
+                else self._openai_logprobs(output)
+            ),
         }
 
     def _process_non_streaming_tool_output(self, output: Any) -> dict[str, Any] | None:

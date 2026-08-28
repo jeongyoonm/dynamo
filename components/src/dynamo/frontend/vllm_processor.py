@@ -15,6 +15,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 from msgspec.structs import replace as msgspec_replace
 from vllm.config import CacheConfig, LoadConfig, ModelConfig, VllmConfig
 from vllm.entrypoints.chat_utils import load_chat_template
@@ -28,6 +29,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor, OutputProcessorOutput
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.outputs import LogprobsLists
 
 from dynamo._internal import ModelDeploymentCard
 from dynamo.common.multimodal.mm_kwargs_transfer import (
@@ -78,6 +80,82 @@ def map_finish_reason(raw_reason: str | None) -> FinishReason | None:
     if mapped is None:
         logger.warning("Unknown finish_reason from router: %s", raw_reason)
     return mapped
+
+
+def _build_engine_core_logprobs(
+    token_ids: list[int],
+    log_probs: Any,
+    top_logprobs: Any,
+) -> LogprobsLists | None:
+    """Convert Dynamo's per-token logprob wire format for vLLM output processing."""
+    if log_probs is None:
+        return None
+    if not isinstance(log_probs, list) or len(log_probs) != len(token_ids):
+        logger.warning(
+            "Dropping misaligned logprobs: token count %d, logprob count %s",
+            len(token_ids),
+            len(log_probs) if isinstance(log_probs, list) else "invalid",
+        )
+        return None
+
+    if top_logprobs is None:
+        top_logprobs = [[] for _ in token_ids]
+    if not isinstance(top_logprobs, list) or len(top_logprobs) != len(token_ids):
+        logger.warning("Dropping logprobs with misaligned top_logprobs")
+        return None
+
+    rows: list[list[tuple[int, float, int]]] = []
+    try:
+        for sampled_id, sampled_logprob, position in zip(
+            token_ids, log_probs, top_logprobs
+        ):
+            if position is None:
+                position = []
+            if not isinstance(position, list):
+                return None
+
+            sampled_rank = 1
+            alternatives: list[tuple[int, float, int]] = []
+            for entry in position:
+                if not isinstance(entry, dict):
+                    continue
+                candidate_id = int(entry["token_id"])
+                candidate_logprob = float(entry["logprob"])
+                candidate_rank = int(entry.get("rank", 0))
+                if candidate_id == sampled_id:
+                    sampled_rank = candidate_rank
+                    continue
+                alternatives.append(
+                    (candidate_id, candidate_logprob, candidate_rank)
+                )
+
+            alternatives.sort(key=lambda value: value[2])
+            rows.append(
+                [(int(sampled_id), float(sampled_logprob), sampled_rank)]
+                + alternatives
+            )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        logger.warning("Dropping malformed logprobs from distributed worker")
+        return None
+
+    if not rows:
+        return None
+    widths = {len(row) for row in rows}
+    if len(widths) != 1:
+        logger.warning("Dropping logprobs with inconsistent top-k widths")
+        return None
+
+    return LogprobsLists(
+        logprob_token_ids=np.asarray(
+            [[candidate[0] for candidate in row] for row in rows], dtype=np.int64
+        ),
+        logprobs=np.asarray(
+            [[candidate[1] for candidate in row] for row in rows], dtype=np.float32
+        ),
+        sampled_token_ranks=np.asarray(
+            [row[0][2] for row in rows], dtype=np.int64
+        ),
+    )
 
 
 def _runtime_config_context_length(mdc: ModelDeploymentCard) -> int | None:
@@ -617,13 +695,6 @@ class VllmProcessor:
             sampling_params.logprobs = logprobs
         elif top_logprobs not in (None, 0):
             sampling_params.logprobs = top_logprobs
-        # TODO: Support logprobs in the distributed vLLM chat processor by
-        # converting worker log_probs/top_logprobs into EngineCoreOutput.new_logprobs.
-        if sampling_params.logprobs is not None:
-            logger.warning(
-                "Logprobs requested but not supported in distributed inference mode"
-            )
-
         with _nvtx.annotate("mm_frontend:process_inputs", color="orange"):
             # render_messages_async returns a raw prompt. Convert it to a typed
             # EngineInput before process_inputs. User UUID requests deliberately
@@ -929,6 +1000,12 @@ class VllmProcessor:
                 if "new_prompt_len_snapshot" in output_fields:
                     output_kwargs["new_prompt_len_snapshot"] = engine_response.get(
                         "new_prompt_len_snapshot"
+                    )
+                if "new_logprobs" in output_fields:
+                    output_kwargs["new_logprobs"] = _build_engine_core_logprobs(
+                        engine_response["token_ids"],
+                        engine_response.get("log_probs"),
+                        engine_response.get("top_logprobs"),
                     )
                 vllm_response = EngineCoreOutput(**output_kwargs)
 
