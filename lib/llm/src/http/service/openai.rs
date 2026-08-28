@@ -133,7 +133,7 @@ pub(super) fn get_body_limit() -> usize {
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Deserialize, Debug)]
 pub(crate) struct ErrorMessage {
     message: String,
     #[serde(rename = "type")]
@@ -143,6 +143,38 @@ pub(crate) struct ErrorMessage {
     details: Option<Box<serde_json::Value>>,
     #[serde(skip)]
     metric_error_type: Option<ErrorType>,
+}
+
+impl Serialize for ErrorMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct ErrorBody<'a> {
+            message: &'a str,
+            #[serde(rename = "type")]
+            error_type: &'a str,
+            code: u16,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            details: Option<&'a serde_json::Value>,
+        }
+
+        #[derive(Serialize)]
+        struct ErrorEnvelope<'a> {
+            error: ErrorBody<'a>,
+        }
+
+        ErrorEnvelope {
+            error: ErrorBody {
+                message: &self.message,
+                error_type: &self.error_type,
+                code: self.code,
+                details: self.details.as_deref(),
+            },
+        }
+        .serialize(serializer)
+    }
 }
 
 impl ErrorMessage {
@@ -6140,9 +6172,9 @@ mod tests {
                 let body = axum::body::to_bytes(response.into_body(), get_body_limit())
                     .await
                     .unwrap();
-                let error: ErrorMessage = serde_json::from_slice(&body).unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(
-                    error.message,
+                    body["error"]["message"],
                     format!(
                         "{VALIDATION_PREFIX}`nvext.extra_fields=[\"{field}\"]` is not supported by the Responses API."
                     )
@@ -7459,6 +7491,20 @@ mod tests {
             extract_error_type_from_response(&response),
             ErrorType::Validation
         );
+    }
+
+    #[test]
+    fn test_error_message_uses_openai_envelope() {
+        let response = ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: "Validation: bad input".to_string(),
+        });
+        let body = serde_json::to_value(response.1.0).unwrap();
+
+        assert_eq!(body["error"]["message"], "Validation: bad input");
+        assert_eq!(body["error"]["type"], "Bad Request");
+        assert_eq!(body["error"]["code"], 400);
+        assert!(body.get("message").is_none());
     }
 
     #[test]

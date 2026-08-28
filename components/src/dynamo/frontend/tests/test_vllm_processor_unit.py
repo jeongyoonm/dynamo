@@ -2940,3 +2940,13 @@ class TestThinkingControlParity:  # FRONTEND.10
             tool_parser_class=None,
         )
         assert kwargs == case.expected
+
+
+def test_to_json_compatible_converts_dataclasses(vllm_processor_module):
+    from vllm.logprobs import Logprob
+
+    assert vllm_processor_module._to_json_compatible(
+        {"sample": Logprob(logprob=-0.5, rank=1, decoded_token="x")}
+    ) == {
+        "sample": {"logprob": -0.5, "rank": 1, "decoded_token": "x"}
+    }

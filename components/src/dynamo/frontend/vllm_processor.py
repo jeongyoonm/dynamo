@@ -12,7 +12,7 @@ import os
 import time
 from argparse import Namespace
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from typing import Any
 
 from msgspec.structs import replace as msgspec_replace
@@ -78,6 +78,31 @@ def map_finish_reason(raw_reason: str | None) -> FinishReason | None:
     if mapped is None:
         logger.warning("Unknown finish_reason from router: %s", raw_reason)
     return mapped
+
+
+def _to_json_compatible(value: Any) -> Any:
+    """Convert vLLM/Pydantic/msgspec response values to JSON builtins."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {key: _to_json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_json_compatible(item) for item in value]
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _to_json_compatible(getattr(value, field.name))
+            for field in fields(value)
+        }
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return _to_json_compatible(model_dump())
+    struct_fields = getattr(value, "__struct_fields__", None)
+    if struct_fields:
+        return {
+            field: _to_json_compatible(getattr(value, field))
+            for field in struct_fields
+        }
+    return value
 
 
 def _runtime_config_context_length(mdc: ModelDeploymentCard) -> int | None:
@@ -624,6 +649,11 @@ class VllmProcessor:
                 "Logprobs requested but not supported in distributed inference mode"
             )
 
+        # vLLM rejects n>1 in greedy mode while the OpenAI API permits it.
+        # A tiny non-zero temperature preserves effectively-greedy sampling
+        # while allowing vLLM to create the requested child sequences.
+        if sampling_params.n > 1 and sampling_params.temperature == 0:
+            sampling_params.temperature = 1e-4
         with _nvtx.annotate("mm_frontend:process_inputs", color="orange"):
             # render_messages_async returns a raw prompt. Convert it to a typed
             # EngineInput before process_inputs. User UUID requests deliberately
@@ -958,7 +988,7 @@ class VllmProcessor:
                             break
                         choice = post.process_output(output)
                         if choice:
-                            choices.append(choice)
+                            choices.append(_to_json_compatible(choice))
 
                 if postprocess_error:
                     continue
@@ -966,6 +996,7 @@ class VllmProcessor:
                 # One envelope per iteration carries both data and metrics so
                 # client cancellation can't drop the annotation between yields.
                 envelope: dict[str, Any] = {"_dynamo_annotated": True}
+                usage_only: dict[str, Any] | None = None
                 if choices:
                     dynamo_out = {
                         "id": request_id,
@@ -975,7 +1006,17 @@ class VllmProcessor:
                         "object": "chat.completion.chunk",
                     }
                     if usage := engine_response.get("completion_usage"):
-                        dynamo_out["usage"] = usage
+                        if request.get("stream"):
+                            usage_only = {
+                                "id": request_id,
+                                "choices": [],
+                                "created": dynamo_out["created"],
+                                "model": request["model"],
+                                "object": "chat.completion.chunk",
+                                "usage": usage,
+                            }
+                        else:
+                            dynamo_out["usage"] = usage
                     envelope["data"] = dynamo_out
 
                 metrics = {
@@ -994,6 +1035,8 @@ class VllmProcessor:
                 envelope["comment"] = [json.dumps(metrics)]
 
                 yield envelope
+                if usage_only is not None:
+                    yield {"_dynamo_annotated": True, "data": usage_only}
             _nvtx.end_range(rng_stream)
         except VLLMClientError:
             # Preserve request-side 400/404/422 errors for generator(), which
